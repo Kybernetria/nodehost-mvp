@@ -51,6 +51,9 @@ internal data class ManagedQemuProcess(
     val processId: Long?,
     val awaitExit: suspend () -> QemuExit,
     val requestGuestShutdown: suspend () -> Unit,
+    val awaitConsoleMarker: suspend (String, Long) -> Unit = { _, _ ->
+        error("console-marker health is unavailable")
+    },
 )
 
 internal interface QemuProcessControl {
@@ -61,7 +64,12 @@ internal interface QemuProcessControl {
 private class RuntimeQemuProcessControl(private val adapter: QemuRuntimeAdapter = QemuRuntimeAdapter()) : QemuProcessControl {
     override suspend fun start(plan: QemuLaunchPlan, runtime: RuntimeSpec): ManagedQemuProcess {
         val handle = adapter.start(plan)
-        return ManagedQemuProcess(handle.processId, { adapter.awaitExit(handle) }, { adapter.requestGuestShutdown(handle) })
+        return ManagedQemuProcess(
+            handle.processId,
+            { adapter.awaitExit(handle) },
+            { adapter.requestGuestShutdown(handle) },
+            { marker, timeoutMillis -> adapter.awaitConsoleMarker(handle, marker, timeoutMillis) },
+        )
     }
     override fun forceStop() = adapter.forceStop()
 }
@@ -73,6 +81,7 @@ internal class AndroidQemuRuntimeBackend(
     private val beginBootToken: suspend (VmProfileId) -> String?,
     private val recoveryPort: RecoverySshHostPort,
     private val qemu: QemuProcessControl = RuntimeQemuProcessControl(),
+    private val artifactTrust: NodeHostArtifactTrust? = null,
     private val elapsedRealtimeMillis: () -> Long = android.os.SystemClock::elapsedRealtime,
     private val gracefulStopMillis: Long = GRACEFUL_STOP_MILLIS,
     private val forceExitMillis: Long = FORCE_EXIT_MILLIS,
@@ -81,6 +90,9 @@ internal class AndroidQemuRuntimeBackend(
     },
 ) : RuntimeBackend {
     private val application = context.applicationContext
+    private val bundledArtifactTrust by lazy {
+        artifactTrust ?: NodeHostArtifactTrust.fromApplication(application)
+    }
     private val artifactRoot = File(application.filesDir, "nodehost-artifacts")
     private val resolver = QemuProfileResolver()
     private val stateLock = Any()
@@ -101,6 +113,7 @@ internal class AndroidQemuRuntimeBackend(
         serviceScope = scope
         wakeReconciler = wake
         handle?.let(::watchExitLocked)
+        if (stopping) handle?.let(::scheduleGracefulDeadlineWake)
     }
 
     override suspend fun observe(id: RuntimeId): RuntimeObservation = synchronized(stateLock) {
@@ -164,27 +177,48 @@ internal class AndroidQemuRuntimeBackend(
                 synchronized(stateLock) {
                     checkNotNull(handle)
                     qmpReady = true
-                    // Legacy Alpine has no metadata callback; successful direct-kernel QMP qualification is its bounded readiness gate.
-                    if (profileId?.value == ALPINE_PROFILE) guestReady = true
                 }
                 StepOutcome(false, "qmp-ready")
             }
             RuntimeStep.WaitForGuest -> {
-                val needsCallback = synchronized(stateLock) { profileId?.value != ALPINE_PROFILE }
-                if (needsCallback) awaitFile(File(instanceDirectory(), "guest-ready"), GUEST_WAIT_MILLIS)
+                val active = synchronized(stateLock) { checkNotNull(handle) }
+                val health = profile(requireNotNull(profileId), verifyArtifacts = false).health
+                when (health.kind) {
+                    HealthKind.CONSOLE_MARKER ->
+                        active.awaitConsoleMarker(requireNotNull(health.marker), GUEST_WAIT_MILLIS)
+                    HealthKind.METADATA_CALLBACK ->
+                        awaitFile(File(instanceDirectory(), "guest-ready"), GUEST_WAIT_MILLIS)
+                    HealthKind.SSH -> error("SSH health is not implemented for this profile")
+                }
                 synchronized(stateLock) { checkNotNull(handle); guestReady = true }
                 StepOutcome(false, "guest-ready")
             }
             RuntimeStep.RequestShutdown -> {
-                val active = synchronized(stateLock) {
-                    stopping = true
-                    gracefulDeadlineElapsedRealtime = elapsedRealtimeMillis() + gracefulStopMillis
-                    handle
+                val (active, firstShutdownRequest) = synchronized(stateLock) {
+                    val current = handle
+                    val first = current != null && !stopping
+                    if (first) {
+                        stopping = true
+                        gracefulDeadlineElapsedRealtime = elapsedRealtimeMillis() + gracefulStopMillis
+                    }
+                    current to first
                 }
-                if (active != null) active.requestGuestShutdown()
-                serviceScope?.launch {
-                    delay(gracefulStopMillis)
-                    synchronized(stateLock) { if (handle === active && stopping) wakeReconciler?.invoke() }
+                // Install this before QMP. A retryable QMP failure must not erase the original
+                // deadline or leave the actor waiting on a failed request with no wake.
+                if (firstShutdownRequest) active?.let(::scheduleGracefulDeadlineWake)
+                try {
+                    if (active != null) {
+                        withTimeout(gracefulStopMillis.coerceAtMost(QMP_SHUTDOWN_TIMEOUT_MILLIS)) {
+                            active.requestGuestShutdown()
+                        }
+                    }
+                } finally {
+                    if (active == null) {
+                        synchronized(stateLock) {
+                            gracefulDeadlineElapsedRealtime = null
+                            stopping = false
+                        }
+                    }
                 }
                 StepOutcome(active != null, "shutdown-requested")
             }
@@ -205,13 +239,16 @@ internal class AndroidQemuRuntimeBackend(
             RuntimeStep.RemoveSystem -> withContext(Dispatchers.IO) {
                 check(synchronized(stateLock) { handle == null }) { "cannot remove a running runtime" }
                 val instance = instanceDirectory()
-                val data = File(instance, "data.raw")
+                val diskName = persistentDiskName(desired.profileId)
+                val data = File(instance, diskName)
+                val durable = durableDataFile(desired.profileId)
                 if (desired.preserveDataOnDelete && data.exists()) {
-                    val durable = durableDataFile()
                     check(durable.parentFile?.mkdirs() == true || durable.parentFile?.isDirectory == true) { "durable data directory unavailable" }
                     check(!durable.exists()) { "durable data disk already exists" }
                     atomicMove(data, durable) // Failure aborts before any system deletion.
                     check(durable.isFile && !data.exists()) { "data disk preservation was not atomic" }
+                } else if (!desired.preserveDataOnDelete && durable.exists()) {
+                    check(durable.delete()) { "preserved data disk could not be discarded" }
                 }
                 deleteBounded(instance, MAX_DELETE_ENTRIES)
                 synchronized(stateLock) {
@@ -252,6 +289,10 @@ internal class AndroidQemuRuntimeBackend(
 
     private fun artifact(id: String, verify: Boolean): ArtifactRef {
         val file = artifactFile(id)
+        if (isBundledArtifact(id)) {
+            val trusted = bundledArtifactTrust.verifyFile(id, file)
+            return ArtifactRef(id, trusted.sha256, trusted.sizeBytes)
+        }
         require(file.isFile && file.length() in 1..MAX_ARTIFACT_BYTES) { "trusted artifact is missing or out of bounds: $id" }
         val digest = sha256(file)
         if (verify) require(expectedDigest(id) == digest) { "artifact digest mismatch: $id" }
@@ -259,22 +300,44 @@ internal class AndroidQemuRuntimeBackend(
     }
 
     private fun artifactFile(id: String): File {
+        if (isBundledArtifact(id)) return requireNotNull(bundledArtifactFile(id))
         val manifest = File(artifactRoot, "$id.manifest.json")
-        if (!manifest.isFile) return File(artifactRoot, id)
-        require(manifest.length() in 1..4096) { "artifact manifest is out of bounds: $id" }
-        val relative = JSONObject(manifest.readText()).getString("relativePath")
-        val resolved = File(artifactRoot, relative).canonicalFile
-        require(resolved.path.startsWith(artifactRoot.canonicalPath + File.separator)) { "artifact manifest escaped its root" }
-        return resolved
+        if (manifest.isFile) {
+            require(manifest.length() in 1..4096) { "artifact manifest is out of bounds: $id" }
+            val relative = JSONObject(manifest.readText()).getString("relativePath")
+            val resolved = File(artifactRoot, relative).canonicalFile
+            require(resolved.path.startsWith(artifactRoot.canonicalPath + File.separator)) { "artifact manifest escaped its root" }
+            return resolved
+        }
+        val imported = File(artifactRoot, id)
+        if (imported.isFile) return imported
+        // Podroid extracts the signed Alpine bundle into filesDir, while imported artifacts
+        // live under nodehost-artifacts. Keep both sources explicit and instance preparation
+        // can consume the bundled profile without requiring a controller upload first.
+        return bundledArtifactFile(id) ?: imported
+    }
+
+    private fun bundledArtifactFile(id: String): File? = when (id) {
+        "podroid-kernel" -> File(application.filesDir, "vmlinuz-virt")
+        "podroid-initramfs" -> File(application.filesDir, "initrd.img")
+        "podroid-alpine-squashfs" -> File(application.filesDir, "alpine-rootfs.squashfs")
+        else -> null
     }
 
     private fun expectedDigest(id: String): String {
+        if (isBundledArtifact(id)) return bundledArtifactTrust.artifact(id).sha256
         val manifest = File(artifactRoot, "$id.manifest.json")
         if (manifest.isFile) return JSONObject(manifest.readText()).getString("sha256")
         val expected = File(artifactRoot, "$id.sha256")
-        require(expected.isFile && expected.length() <= 128) { "artifact digest metadata is missing: $id" }
-        return expected.readText().trim()
+        if (expected.isFile) {
+            require(expected.length() <= 128) { "artifact digest metadata is out of bounds: $id" }
+            return expected.readText().trim()
+        }
+        error("artifact digest metadata is missing: $id")
     }
+
+    private fun isBundledArtifact(id: String): Boolean =
+        id == "podroid-kernel" || id == "podroid-initramfs" || id == "podroid-alpine-squashfs"
 
     private fun prepareDisks(runtime: RuntimeSpec) {
         val instance = instanceDirectory().apply { check(mkdirs() || isDirectory) }
@@ -285,6 +348,12 @@ internal class AndroidQemuRuntimeBackend(
                 copyVerified("podroid-initramfs", File(artifacts, "initrd.img"))
                 copyVerified("podroid-alpine-squashfs", File(artifacts, "alpine-rootfs.squashfs"))
                 val overlay = File(instance, "storage.img")
+                val durable = durableDataFile(runtime.profileId)
+                if (!overlay.exists() && durable.exists()) {
+                    check(atomicMove(durable, overlay).let { overlay.isFile && !durable.exists() }) {
+                        "data disk restoration was not atomic"
+                    }
+                }
                 if (!overlay.exists()) RandomAccessFile(overlay, "rw").use { it.setLength(runtime.dataDiskGiB * GIB) }
             }
             UBUNTU_PROFILE, K3S_PROFILE -> {
@@ -293,7 +362,7 @@ internal class AndroidQemuRuntimeBackend(
                 copyVerifiedOnce("aavmf-vars", File(instance, "firmware-vars.fd"))
                 copyVerifiedOnce("ubuntu-2404-arm64-cloud", File(instance, "system.qcow2"))
                 val data = File(instance, "data.raw")
-                val durable = durableDataFile()
+                val durable = durableDataFile(runtime.profileId)
                 if (!data.exists() && durable.exists()) {
                     atomicMove(durable, data)
                     check(data.isFile && !durable.exists()) { "data disk restoration was not atomic" }
@@ -331,6 +400,19 @@ internal class AndroidQemuRuntimeBackend(
         }
     }
 
+    private fun scheduleGracefulDeadlineWake(active: ManagedQemuProcess) {
+        val scope = serviceScope ?: return
+        scope.launch {
+            val deadline = synchronized(stateLock) {
+                if (handle === active && stopping) gracefulDeadlineElapsedRealtime else null
+            } ?: return@launch
+            delay((deadline - elapsedRealtimeMillis()).coerceAtLeast(0L))
+            synchronized(stateLock) {
+                if (handle === active && stopping) wakeReconciler?.invoke()
+            }
+        }
+    }
+
     private fun watchExitLocked(started: ManagedQemuProcess) {
         val scope = serviceScope ?: return
         exitWatcher?.cancel()
@@ -353,7 +435,15 @@ internal class AndroidQemuRuntimeBackend(
     }
 
     private fun instanceDirectory() = File(application.filesDir, "vms/default")
-    private fun durableDataFile() = File(application.filesDir, "nodehost-durable/vms/default/data.raw")
+
+    private fun persistentDiskName(profileId: VmProfileId): String = when (profileId.value) {
+        ALPINE_PROFILE -> "storage.img"
+        UBUNTU_PROFILE, K3S_PROFILE -> "data.raw"
+        else -> error("unsupported profile: ${profileId.value}")
+    }
+
+    private fun durableDataFile(profileId: VmProfileId): File =
+        File(application.filesDir, "nodehost-durable/vms/default/${persistentDiskName(profileId)}")
 
     private fun sha256(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
@@ -391,6 +481,7 @@ internal class AndroidQemuRuntimeBackend(
         const val POLL_MILLIS = 100L
         const val GRACEFUL_STOP_MILLIS = 20_000L
         const val FORCE_EXIT_MILLIS = 5_000L
+        const val QMP_SHUTDOWN_TIMEOUT_MILLIS = 3_000L
         const val GIB = 1024L * 1024 * 1024
     }
 }

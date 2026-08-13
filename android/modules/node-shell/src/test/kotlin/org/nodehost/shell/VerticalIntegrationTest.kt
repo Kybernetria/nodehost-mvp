@@ -172,6 +172,7 @@ class VerticalIntegrationTest {
             beginBootToken = { profile -> bootProfiles += profile; "v".repeat(43) },
             recoveryPort = org.nodehost.qemu.RecoverySshHostPort(19922),
             qemu = qemu,
+            artifactTrust = fixtureTrust(),
             gracefulStopMillis = 1_000,
         )
         val actor = ReconciliationActor(scope, operations, backend)
@@ -432,10 +433,23 @@ class VerticalIntegrationTest {
         ).forEach { id ->
             val bytes = "vertical-fixture-$id".toByteArray()
             File(root, id).writeBytes(bytes)
+            if (id == "podroid-kernel") File(context.filesDir, "vmlinuz-virt").writeBytes(bytes)
+            if (id == "podroid-initramfs") File(context.filesDir, "initrd.img").writeBytes(bytes)
+            if (id == "podroid-alpine-squashfs") File(context.filesDir, "alpine-rootfs.squashfs").writeBytes(bytes)
             val digest = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
             File(root, "$id.sha256").writeText("$digest\n")
         }
     }
+
+    private fun fixtureTrust(): NodeHostArtifactTrust = NodeHostArtifactTrust.fromDigests(
+        listOf("podroid-kernel", "podroid-initramfs", "podroid-alpine-squashfs").associateWith { id ->
+            val bytes = "vertical-fixture-$id".toByteArray()
+            TrustedArtifact(
+                MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) },
+                bytes.size.toLong(),
+            )
+        },
+    )
 
     private class ReplacingQemuControl(private val instance: File) : QemuProcessControl {
         private var activeExit: CompletableDeferred<QemuExit>? = null

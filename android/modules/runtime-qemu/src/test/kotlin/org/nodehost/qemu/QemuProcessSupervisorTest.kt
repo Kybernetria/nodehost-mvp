@@ -1,6 +1,7 @@
 package org.nodehost.qemu
 
 import java.io.ByteArrayInputStream
+import java.io.IOException
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
@@ -8,6 +9,7 @@ import java.io.OutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.createTempDirectory
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
@@ -15,6 +17,42 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class QemuProcessSupervisorTest {
+    @Test
+    fun consoleMarkerWaitContinuesAfterTimeoutAndSilentRead() = runBlocking {
+        val socket = ScriptedConsoleSocket(
+            ConsoleRead.Timeout,
+            ConsoleRead.Silent,
+            ConsoleRead.Bytes("boot output\\nReady!\\n"),
+        )
+        val adapter = QemuRuntimeAdapter.forTesting(ConsoleSocketFactory { socket })
+        val handle = QemuProcessHandle(
+            processId = null,
+            exit = CompletableDeferred(),
+            qmpSocketPath = File("qmp.sock"),
+            serialSocketPath = File("serial.sock"),
+        )
+
+        adapter.awaitConsoleMarker(handle, "Ready!", timeoutMillis = 1_000)
+
+        assertTrue(socket.connected)
+        assertTrue(socket.closed)
+    }
+
+    @Test
+    fun consoleMarkerWaitPropagatesNonTimeoutReadFailure() = runBlocking {
+        val failure = IOException("console disconnected")
+        val socket = ScriptedConsoleSocket(ConsoleRead.Failure(failure))
+        val adapter = QemuRuntimeAdapter.forTesting(ConsoleSocketFactory { socket })
+        val handle = QemuProcessHandle(null, CompletableDeferred(), File("qmp.sock"), File("serial.sock"))
+
+        val thrown = assertThrows(IOException::class.java) {
+            runBlocking { adapter.awaitConsoleMarker(handle, "Ready!", timeoutMillis = 1_000) }
+        }
+
+        assertEquals(failure.message, thrown.message)
+        assertTrue(socket.closed)
+    }
+
     @Test
     fun spawnAndReapUseSameDedicatedThreadAndCaptureBoundedDiagnostics() = runBlocking {
         val root = createTempDirectory("qemu-supervisor-").toFile()
@@ -50,15 +88,50 @@ class QemuProcessSupervisorTest {
             val executable = File(root, "qemu").apply { writeText("fixture") }
             val descriptor = QemuTestFixtures.descriptor(root, executable)
             descriptor.workingDirectory.mkdirs()
-            descriptor.sockets.single().writeText("stale")
+            descriptor.sockets.single { it.name == "qmp.sock" }.writeText("stale")
             val process = ControlledProcess("")
             val supervisor = QemuProcessSupervisor { process }
             val handle = supervisor.start(descriptor)
-            assertTrue(!descriptor.sockets.single().exists())
+            assertTrue(descriptor.sockets.none { it.exists() })
+            assertEquals("serial.sock", handle.serialSocketPath.name)
             process.finish(0)
             assertEquals(0, handle.exit.await().code)
         } finally {
             root.deleteRecursively()
+        }
+    }
+
+    private sealed interface ConsoleRead {
+        data object Timeout : ConsoleRead
+        data object Silent : ConsoleRead
+        data class Bytes(val value: String) : ConsoleRead
+        data class Failure(val value: IOException) : ConsoleRead
+    }
+
+    private class ScriptedConsoleSocket(private vararg val reads: ConsoleRead) : ConsoleSocket {
+        private var nextRead = 0
+        var connected = false
+        var closed = false
+
+        override fun connect(path: File) {
+            connected = true
+        }
+
+        override fun read(buffer: ByteArray): Int {
+            return when (val read = reads[nextRead++]) {
+                ConsoleRead.Timeout -> throw IOException("timeout")
+                ConsoleRead.Silent -> 0
+                is ConsoleRead.Bytes -> {
+                    val bytes = read.value.toByteArray()
+                    bytes.copyInto(buffer)
+                    bytes.size
+                }
+                is ConsoleRead.Failure -> throw read.value
+            }
+        }
+
+        override fun close() {
+            closed = true
         }
     }
 

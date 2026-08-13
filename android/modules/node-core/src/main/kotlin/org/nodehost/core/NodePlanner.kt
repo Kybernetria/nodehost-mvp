@@ -15,10 +15,11 @@ object NodePlanner {
     private fun planRunning(desired: RuntimeSpec, observed: RuntimeObservation): RuntimePlan =
         when (observed) {
             is RuntimeObservation.Running ->
-                if (observed.appliedGeneration != null && observed.appliedGeneration != desired.generation) {
-                    RuntimePlan(listOf(RuntimeStep.RequestShutdown))
-                } else {
-                    RuntimePlan(emptyList())
+                when {
+                    observed.appliedGeneration != null && observed.appliedGeneration != desired.generation ->
+                        RuntimePlan(listOf(RuntimeStep.RequestShutdown))
+                    !observed.guestReady -> RuntimePlan(listOf(RuntimeStep.WaitForGuest))
+                    else -> RuntimePlan(emptyList())
                 }
             is RuntimeObservation.Starting -> RuntimePlan(
                 listOf(RuntimeStep.WaitForQmp, RuntimeStep.WaitForGuest),

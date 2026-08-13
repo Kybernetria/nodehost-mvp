@@ -1,29 +1,120 @@
 package org.nodehost.qemu
 
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
+import java.io.Closeable
 import java.io.File
+import java.io.IOException
+import java.net.SocketTimeoutException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
 /** Public lifecycle surface. Command compilation and the QMP socket remain module-internal. */
-class QemuRuntimeAdapter {
+class QemuRuntimeAdapter private constructor(
+    private val consoleSocketFactory: ConsoleSocketFactory,
+) {
+    constructor() : this(ConsoleSocketFactory { AndroidConsoleSocket() })
+
     private val supervisor = QemuProcessSupervisor()
 
     suspend fun start(plan: QemuLaunchPlan): QemuProcessHandle = supervisor.start(QemuCommandCompiler().compile(plan.resolved))
     suspend fun awaitExit(handle: QemuProcessHandle): QemuExit = handle.exit.await()
+
+    /** Reads the guest serial stream until the profile-declared marker is observed. */
+    suspend fun awaitConsoleMarker(handle: QemuProcessHandle, marker: String, timeoutMillis: Long) {
+        require(marker.isNotEmpty() && marker.length <= 128 && '\u0000' !in marker)
+        require(timeoutMillis > 0)
+        withTimeout(timeoutMillis) {
+            val socket = consoleSocketFactory.open()
+            // LocalSocket reads are blocking. Close the socket as soon as cancellation
+            // occurs so a deadline does not wait for another console byte.
+            val closeOnCancellation = requireNotNull(currentCoroutineContext()[Job]).invokeOnCompletion {
+                runCatching { socket.close() }
+            }
+            try {
+                withContext(Dispatchers.IO) {
+                    runInterruptible { socket.connect(handle.serialSocketPath) }
+                    val rolling = StringBuilder()
+                    val buffer = ByteArray(CONSOLE_READ_BUFFER_BYTES)
+                    while (true) {
+                        val count = try {
+                            runInterruptible { socket.read(buffer) }
+                        } catch (failure: IOException) {
+                            currentCoroutineContext().ensureActive()
+                            if (failure.isConsoleReadTimeout()) continue
+                            throw failure
+                        }
+                        if (count < 0) error("guest console closed before readiness marker")
+                        if (count == 0) continue
+                        rolling.append(String(buffer, 0, count, Charsets.UTF_8))
+                        if (rolling.contains(marker)) return@withContext
+                        if (rolling.length > MAX_CONSOLE_SCAN_CHARS) {
+                            rolling.delete(0, rolling.length - MAX_CONSOLE_SCAN_CHARS)
+                        }
+                    }
+                }
+            } finally {
+                closeOnCancellation.dispose()
+                runCatching { socket.close() }
+            }
+        }
+    }
+
     suspend fun requestGuestShutdown(handle: QemuProcessHandle) {
         QmpSession(handle.qmpSocketPath).use { qmp -> qmp.connect(); qmp.systemPowerdown() }
     }
     fun requestStop() = supervisor.terminate()
     fun forceStop() = supervisor.forceTerminate()
+
+    internal companion object {
+        fun forTesting(consoleSocketFactory: ConsoleSocketFactory) = QemuRuntimeAdapter(consoleSocketFactory)
+
+        const val CONSOLE_READ_BUFFER_BYTES = 4 * 1024
+        const val MAX_CONSOLE_SCAN_CHARS = 64 * 1024
+    }
+}
+
+internal fun interface ConsoleSocketFactory {
+    fun open(): ConsoleSocket
+}
+
+internal interface ConsoleSocket : Closeable {
+    fun connect(path: File)
+    fun read(buffer: ByteArray): Int
+}
+
+private class AndroidConsoleSocket : ConsoleSocket {
+    private val socket = LocalSocket()
+
+    override fun connect(path: File) {
+        socket.connect(LocalSocketAddress(path.path, LocalSocketAddress.Namespace.FILESYSTEM))
+    }
+
+    override fun read(buffer: ByteArray): Int = socket.inputStream.read(buffer)
+
+    override fun close() = socket.close()
+}
+
+private fun IOException.isConsoleReadTimeout(): Boolean {
+    if (this is SocketTimeoutException) return true
+    val text = message?.lowercase() ?: return false
+    return "timeout" in text || "timed out" in text
 }
 
 class QemuProcessHandle internal constructor(
     val processId: Long?,
     internal val exit: Deferred<QemuExit>,
     internal val qmpSocketPath: File,
+    internal val serialSocketPath: File,
 )
 data class QemuExit(val code: Int, val stderrTail: List<String>)
 
@@ -46,6 +137,8 @@ internal class QemuProcessSupervisor(
             QemuProcessHandle(
                 processId(process), lifetime.exited,
                 descriptor.sockets.single { it.name == "qmp.sock" },
+                descriptor.sockets.firstOrNull { it.name == "serial.sock" }
+                    ?: descriptor.sockets.single { it.name == "qmp.sock" },
             )
         } catch (failure: Throwable) {
             lifetime.cancelled = true

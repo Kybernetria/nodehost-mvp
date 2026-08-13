@@ -49,6 +49,9 @@ internal object QemuTestFixtures {
         workingDirectory = File(root, "vms/default"),
         environment = mapOf("LD_LIBRARY_PATH" to root.path),
         arguments = listOf("-display", "none"),
-        sockets = listOf(File(root, "vms/default/qmp.sock")),
+        sockets = listOf(
+            File(root, "vms/default/qmp.sock"),
+            File(root, "vms/default/serial.sock"),
+        ),
     )
 }

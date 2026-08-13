@@ -43,6 +43,17 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), f"Bearer {self.capability}")
 
     @mock.patch("urllib.request.urlopen")
+    def test_delete_retry_reuses_supplied_idempotency_key(self, urlopen: mock.Mock) -> None:
+        urlopen.side_effect = [_Response(b'{"id":"op-1"}'), _Response(b'{"id":"op-1"}')]
+        first = self.client.remove_vm("default", "delete-key-000001")
+        second = self.client.remove_vm("default", "delete-key-000001")
+        self.assertEqual(first, second)
+        self.assertEqual(
+            [call.args[0].get_header("Idempotency-key") for call in urlopen.call_args_list],
+            ["delete-key-000001", "delete-key-000001"],
+        )
+
+    @mock.patch("urllib.request.urlopen")
     def test_oversized_response_is_rejected(self, urlopen: mock.Mock) -> None:
         urlopen.return_value = _Response(b"x" * (NodeHostClient.MAX_RESPONSE_BYTES + 1))
         with self.assertRaisesRegex(ApiError, "exceeds"): self.client.status()

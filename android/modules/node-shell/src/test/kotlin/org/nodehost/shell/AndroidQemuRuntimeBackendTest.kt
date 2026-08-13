@@ -53,6 +53,9 @@ class AndroidQemuRuntimeBackendTest {
         File(context.filesDir, "nodehost-artifacts").deleteRecursively()
         File(context.filesDir, "vms").deleteRecursively()
         File(context.filesDir, "nodehost-durable").deleteRecursively()
+        listOf("vmlinuz-virt", "initrd.img", "alpine-rootfs.squashfs").forEach {
+            File(context.filesDir, it).delete()
+        }
     }
 
     @Test fun allAdvertisedProfilesResolveToBackedTypedBootModes() {
@@ -63,6 +66,50 @@ class AndroidQemuRuntimeBackendTest {
         assertTrue(k3s.boot is BootSpec.Uefi)
         assertEquals(VmProfileId("ubuntu-2404-arm64-uefi"), k3s.extends)
         assertTrue(k3s.requirements.qualificationChecks.contains("tailscale-reachability"))
+    }
+
+    @Test fun filesDirCandidateCannotSupplyTrustAnchor() {
+        listOf("vmlinuz-virt", "initrd.img", "alpine-rootfs.squashfs").forEach {
+            File(context.filesDir, it).delete()
+        }
+        val backend = backend(FakeQemuControl())
+
+        assertTrue(runCatching {
+            backend.profile(VmProfileId("alpine-direct-qualification"), true)
+        }.isFailure)
+    }
+
+    @Test fun equalSizeFilesDirSubstitutionFailsAgainstApkTrustAnchor() {
+        val candidate = File(context.filesDir, "vmlinuz-virt")
+        candidate.writeBytes(ByteArray(candidate.length().toInt()) { 'x'.code.toByte() })
+        val backend = backend(FakeQemuControl())
+
+        assertTrue(runCatching {
+            backend.profile(VmProfileId("alpine-direct-qualification"), true)
+        }.isFailure)
+    }
+
+    @Test fun bundledAlpineArtifactsAreResolvedFromPodroidFilesDirectory() = runBlocking {
+        File(context.filesDir, "nodehost-artifacts").deleteRecursively()
+        listOf("podroid-kernel", "podroid-initramfs", "podroid-alpine-squashfs").forEach { id ->
+            val name = when (id) {
+                "podroid-kernel" -> "vmlinuz-virt"
+                "podroid-initramfs" -> "initrd.img"
+                else -> "alpine-rootfs.squashfs"
+            }
+            File(context.filesDir, name).writeBytes("fixture-$id".toByteArray())
+        }
+        val backend = backend(FakeQemuControl(), runtime = RuntimeSpec(
+            generation = 1, desiredState = DesiredRuntimeState.RUNNING,
+            profileId = VmProfileId("alpine-direct-qualification"), memoryMiB = 512,
+            vcpus = 1, dataDiskGiB = 4,
+        ))
+
+        backend.execute(operationContext("prepare"), RuntimeStep.PrepareDisks)
+
+        assertTrue(File(context.filesDir, "vms/default/artifacts/vmlinuz-virt").isFile)
+        assertTrue(File(context.filesDir, "vms/default/artifacts/initrd.img").isFile)
+        assertTrue(File(context.filesDir, "vms/default/artifacts/alpine-rootfs.squashfs").isFile)
     }
 
     @Test fun mutableSystemStateSurvivesRepeatedPreparationAfterBootstrapConsumption() = runBlocking {
@@ -78,6 +125,24 @@ class AndroidQemuRuntimeBackendTest {
 
         assertArrayEquals(systemMutation, File(instance, "system.qcow2").readBytes())
         assertArrayEquals(varsMutation, File(instance, "firmware-vars.fd").readBytes())
+    }
+
+    @Test fun alpinePreservedStorageDiskMovesOutBeforeDeleteAndReattachesOnRecreate() = runBlocking {
+        val runtime = RuntimeSpec(
+            generation = 1, desiredState = DesiredRuntimeState.RUNNING,
+            profileId = VmProfileId("alpine-direct-qualification"), memoryMiB = 512,
+            vcpus = 1, dataDiskGiB = 4, preserveDataOnDelete = true,
+        )
+        val backend = backend(FakeQemuControl(), runtime = runtime)
+        backend.execute(operationContext("prepare"), RuntimeStep.PrepareDisks)
+        val data = File(context.filesDir, "vms/default/storage.img")
+        RandomAccessFile(data, "rw").use { it.seek(7); it.write(byteArrayOf(42)) }
+
+        backend.execute(operationContext("remove"), RuntimeStep.RemoveSystem)
+        assertTrue(File(context.filesDir, "nodehost-durable/vms/default/storage.img").isFile)
+        assertFalse(File(context.filesDir, "nodehost-durable/vms/default/data.raw").exists())
+        backend.execute(operationContext("recreate"), RuntimeStep.PrepareDisks)
+        RandomAccessFile(data, "r").use { it.seek(7); assertEquals(42, it.read()) }
     }
 
     @Test fun preservedDataMovesOutBeforeDeleteAndReattachesOnRecreate() = runBlocking {
@@ -102,6 +167,28 @@ class AndroidQemuRuntimeBackendTest {
         assertTrue(File(context.filesDir, "vms/default/data.raw").isFile)
     }
 
+    @Test fun alpineReadinessWaitsForConsoleMarker() = runBlocking {
+        val qemu = FakeQemuControl()
+        val backend = backend(qemu, runtime = RuntimeSpec(
+            generation = 1, desiredState = DesiredRuntimeState.RUNNING,
+            profileId = VmProfileId("alpine-direct-qualification"), memoryMiB = 512,
+            vcpus = 1, dataDiskGiB = 4,
+        ))
+        backend.execute(operationContext("prepare"), RuntimeStep.PrepareBoot)
+        backend.execute(operationContext("start"), RuntimeStep.StartProcess)
+        File(context.filesDir, "vms/default/qmp.sock").apply { parentFile!!.mkdirs(); createNewFile() }
+        backend.execute(operationContext("qmp"), RuntimeStep.WaitForQmp)
+
+        assertTrue(runCatching {
+            backend.execute(operationContext("guest"), RuntimeStep.WaitForGuest)
+        }.isFailure)
+        assertFalse((backend.observe(RuntimeId.DEFAULT) as RuntimeObservation.Running).guestReady)
+        qemu.consoleMarkerReady = true
+        backend.execute(operationContext("guest-2"), RuntimeStep.WaitForGuest)
+        assertTrue((backend.observe(RuntimeId.DEFAULT) as RuntimeObservation.Running).guestReady)
+        assertEquals(listOf("Ready!", "Ready!"), qemu.consoleMarkers)
+    }
+
     @Test fun gracefulDeadlineForceStopExitAndWakeAreObserved() = runBlocking {
         var elapsed = 0L
         var wakes = 0
@@ -124,6 +211,32 @@ class AndroidQemuRuntimeBackendTest {
         assertTrue(backend.observe(RuntimeId.DEFAULT) is RuntimeObservation.Absent)
     }
 
+    @Test fun qmpFailureKeepsOriginalDeadlineAndStillWakesForceStop() = runBlocking {
+        var elapsed = 0L
+        var wakes = 0
+        val qemu = FakeQemuControl().also { it.shutdownFailure = IllegalStateException("QMP unavailable") }
+        val backend = backend(qemu, elapsedRealtime = { elapsed })
+        backend.attachLifecycle(scope) { wakes++ }
+        backend.execute(operationContext("prepare"), RuntimeStep.PrepareBoot)
+        backend.execute(operationContext("start"), RuntimeStep.StartProcess)
+
+        assertTrue(runCatching {
+            backend.execute(operationContext("shutdown-1"), RuntimeStep.RequestShutdown)
+        }.isFailure)
+        elapsed = 9
+        assertTrue(runCatching {
+            backend.execute(operationContext("shutdown-2"), RuntimeStep.RequestShutdown)
+        }.isFailure)
+        assertFalse((backend.observe(RuntimeId.DEFAULT) as RuntimeObservation.Stopping).gracefulDeadlineExceeded)
+        elapsed = 11
+        assertTrue((backend.observe(RuntimeId.DEFAULT) as RuntimeObservation.Stopping).gracefulDeadlineExceeded)
+        withTimeout(2_000) { while (wakes == 0) kotlinx.coroutines.yield() }
+
+        backend.execute(operationContext("force"), RuntimeStep.ForceStop)
+        assertEquals(1, qemu.forceStops)
+        assertTrue(backend.observe(RuntimeId.DEFAULT) is RuntimeObservation.Absent)
+    }
+
     @Test fun runningObservationRetainsPreparedGenerationWhenDesiredChanges() = runBlocking {
         var desired = testRuntime()
         val qemu = FakeQemuControl()
@@ -133,6 +246,7 @@ class AndroidQemuRuntimeBackendTest {
             beginBootToken = { "b".repeat(43) },
             recoveryPort = org.nodehost.qemu.RecoverySshHostPort(19922),
             qemu = qemu,
+            artifactTrust = fixtureTrust(),
         )
         backend.attachLifecycle(scope) {}
         backend.execute(operationContext("prepare"), RuntimeStep.PrepareBoot)
@@ -175,6 +289,7 @@ class AndroidQemuRuntimeBackendTest {
         beginBootToken = { "b".repeat(43) },
         recoveryPort = org.nodehost.qemu.RecoverySshHostPort(19922),
         qemu = qemu,
+        artifactTrust = fixtureTrust(),
         elapsedRealtimeMillis = elapsedRealtime,
         gracefulStopMillis = 10,
         forceExitMillis = 1_000,
@@ -197,19 +312,41 @@ class AndroidQemuRuntimeBackendTest {
         ).forEach { id ->
             val bytes = "fixture-$id".toByteArray()
             File(root, id).writeBytes(bytes)
+            if (id == "podroid-kernel") File(context.filesDir, "vmlinuz-virt").writeBytes(bytes)
+            if (id == "podroid-initramfs") File(context.filesDir, "initrd.img").writeBytes(bytes)
+            if (id == "podroid-alpine-squashfs") File(context.filesDir, "alpine-rootfs.squashfs").writeBytes(bytes)
             val digest = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
             File(root, "$id.sha256").writeText("$digest\n")
         }
     }
 
+    private fun fixtureTrust(): NodeHostArtifactTrust = NodeHostArtifactTrust.fromDigests(
+        listOf("podroid-kernel", "podroid-initramfs", "podroid-alpine-squashfs").associateWith { id ->
+            val bytes = "fixture-$id".toByteArray()
+            TrustedArtifact(
+                MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) },
+                bytes.size.toLong(),
+            )
+        },
+    )
+
     private class FakeQemuControl : QemuProcessControl {
         val exit = CompletableDeferred<QemuExit>()
         val startedRuntimes = mutableListOf<RuntimeSpec>()
         var shutdownRequests = 0
+        var shutdownFailure: Throwable? = null
         var forceStops = 0
+        var consoleMarkerReady = false
+        val consoleMarkers = mutableListOf<String>()
         override suspend fun start(plan: QemuLaunchPlan, runtime: RuntimeSpec): ManagedQemuProcess {
             startedRuntimes += runtime
-            return ManagedQemuProcess(42, { exit.await() }, { shutdownRequests++ })
+            return ManagedQemuProcess(
+                42, { exit.await() }, {
+                    shutdownFailure?.let { throw it }
+                    shutdownRequests++
+                },
+                { marker, _ -> consoleMarkers += marker; check(consoleMarkerReady) { "marker not observed" } },
+            )
         }
         override fun forceStop() {
             forceStops++

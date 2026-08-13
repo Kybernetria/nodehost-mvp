@@ -95,7 +95,7 @@ class RoomOperationRepositoryTest {
 
         assertEquals(
             OperationState.CANCELLED,
-            repository.cancelOperation(operation.id, setOf(OperationState.ACCEPTED)).state,
+            repository.cancelOperation(operation.id, setOf(OperationState.STARTING_QEMU)).state,
         )
         assertEquals(DesiredRuntimeState.RUNNING, repository.loadDesiredRuntime(RuntimeId.DEFAULT)?.desiredState)
         assertEquals(false, repository.completeStep(intent, StepOutcome(true, "started")))

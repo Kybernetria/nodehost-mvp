@@ -5,12 +5,14 @@ import java.security.MessageDigest
 import org.nodehost.core.Clock
 import org.nodehost.core.DesiredRuntimeAcceptance
 import org.nodehost.core.OperationRepository
+import org.nodehost.core.RuntimeStep
 import org.nodehost.core.StepOutcome
 import org.nodehost.model.DesiredRuntimeState
 import org.nodehost.model.GenerationDecision
 import org.nodehost.model.OperationId
 import org.nodehost.model.OperationRecord
 import org.nodehost.model.OperationState
+import org.nodehost.model.OperationTransitions
 import org.nodehost.model.RuntimeGenerationRules
 import org.nodehost.model.RuntimeId
 import org.nodehost.model.RuntimeObservation
@@ -25,6 +27,9 @@ class RoomOperationRepository(
     private val dao get() = database.dao()
 
     override suspend fun load(id: OperationId): OperationRecord? = dao.operation(id.value)?.toModel()
+
+    /** Durable lookup used before reconstructing a DELETE request after a lost response. */
+    suspend fun operationForIdempotencyKey(key: String): OperationRecord? = dao.operationByKey(key)?.toModel()
 
     override suspend fun save(record: OperationRecord) {
         database.withTransaction {
@@ -165,9 +170,20 @@ class RoomOperationRepository(
             resultDetail = null,
             errorCode = null,
         )
+        val currentState = OperationState.valueOf(stored.state)
+        val proposedState = lifecycleStateForStep(stepId) ?: currentState
+        val nextState = when {
+            proposedState == currentState -> currentState
+            OperationTransitions.isAllowed(currentState, proposedState) -> proposedState
+            currentState in LIFECYCLE_STATES && proposedState in LIFECYCLE_STATES &&
+                LIFECYCLE_STATES.indexOf(currentState) > LIFECYCLE_STATES.indexOf(proposedState) -> currentState
+            else -> OperationTransitions.requireAllowed(currentState, proposedState)
+                .let { proposedState }
+        }
         dao.insertStep(intent)
         check(dao.compareAndSetOperation(
-            stored.id, stored.state, stored.state, stepId, stored.errorCode, now,
+            stored.id, stored.state, nextState.name, stepId,
+            if (nextState == currentState) stored.errorCode else null, now,
         ) == 1) { "operation changed concurrently" }
         BeginStepResult(intent, recovered = false)
     }
@@ -191,8 +207,13 @@ class RoomOperationRepository(
             intent.operationId, intent.stepId, intent.attempt, StepStatus.FAILED.name,
             now, null, null, errorCode,
         ) == 1) { "step changed concurrently" }
+        val nextState = if (intent.attempt >= MAX_STEP_ATTEMPTS) {
+            OperationState.FAILED_PERMANENT
+        } else {
+            OperationState.FAILED_RETRYABLE
+        }
         dao.compareAndSetOperation(
-            stored.id, stored.state, OperationState.FAILED_RETRYABLE.name,
+            stored.id, stored.state, nextState.name,
             stored.currentStepId, errorCode, now,
         ) == 1
     }
@@ -221,6 +242,18 @@ class RoomOperationRepository(
     }
 
     suspend fun steps(operationId: OperationId): List<OperationStepEntity> = dao.steps(operationId.value)
+
+    private fun lifecycleStateForStep(stepId: String): OperationState? = when (stepId) {
+        RuntimeStep.VerifyProfile.id, RuntimeStep.RequestShutdown.id,
+        RuntimeStep.ForceStop.id, RuntimeStep.RemoveSystem.id -> OperationState.PREFLIGHT
+        RuntimeStep.ResolveArtifacts.id -> OperationState.FETCHING
+        RuntimeStep.PrepareDisks.id -> OperationState.PREPARING_DISKS
+        RuntimeStep.PrepareBoot.id -> OperationState.PREPARING_BOOT
+        RuntimeStep.StartProcess.id -> OperationState.STARTING_QEMU
+        RuntimeStep.WaitForQmp.id -> OperationState.WAITING_FOR_QMP
+        RuntimeStep.WaitForGuest.id -> OperationState.BOOTSTRAPPING_GUEST
+        else -> null
+    }
 
     private suspend fun latestSystemReconciliation(spec: RuntimeSpec): OperationRecord? {
         val slots = (1..MAX_RETAINED_SYSTEM_RECONCILIATIONS_PER_GENERATION).mapNotNull { slot ->
@@ -265,6 +298,13 @@ class RoomOperationRepository(
         private const val MAX_RESULT_DETAIL_CHARS = 512
         private const val UNKNOWN_EFFECT_OUTCOME = "UNKNOWN_EFFECT_OUTCOME"
         private val ERROR_CODE = Regex("[A-Z][A-Z0-9_]{0,63}")
+        private val LIFECYCLE_STATES = listOf(
+            OperationState.PREFLIGHT, OperationState.FETCHING, OperationState.VERIFYING,
+            OperationState.PREPARING_DISKS, OperationState.PREPARING_BOOT,
+            OperationState.STARTING_QEMU, OperationState.WAITING_FOR_QMP,
+            OperationState.BOOTSTRAPPING_GUEST, OperationState.WAITING_FOR_SSH,
+            OperationState.WAITING_FOR_GUEST_MESH,
+        )
         private val EFFECT_BLOCKING_STATE_NAMES = (
             OperationState.entries.filter { it.terminal } + OperationState.CANCELLING
         ).mapTo(mutableSetOf()) { it.name }

@@ -4,6 +4,7 @@ import java.io.Closeable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import org.nodehost.core.NodePlanner
@@ -23,9 +24,19 @@ class ReconciliationActor(
     private val store: RoomOperationRepository,
     private val runtime: RuntimeBackend,
     private val effectTimeoutMillis: Long = DEFAULT_EFFECT_TIMEOUT_MILLIS,
+    private val retryBaseDelayMillis: Long = DEFAULT_RETRY_BASE_DELAY_MILLIS,
+    private val retryMaxDelayMillis: Long = DEFAULT_RETRY_MAX_DELAY_MILLIS,
     private val events: (ReconciliationEvent) -> Unit = {},
 ) : Closeable {
+    init {
+        require(effectTimeoutMillis > 0)
+        require(retryBaseDelayMillis > 0 && retryMaxDelayMillis >= retryBaseDelayMillis)
+        require(retryMaxDelayMillis <= MAX_RETRY_DELAY_MILLIS)
+    }
+
+    private val actorScope = scope
     private val wakes = Channel<WakeReason>(Channel.CONFLATED)
+    private var retryJob: Job? = null
     private val actorJob: Job = scope.launch {
         for (reason in wakes) {
             try {
@@ -100,7 +111,10 @@ class ReconciliationActor(
                     intent,
                     if (failure is kotlinx.coroutines.TimeoutCancellationException) "EFFECT_TIMEOUT" else "EFFECT_FAILED",
                 )
-                if (failed) throw failure
+                if (failed) {
+                    scheduleRetry(intent.attempt)
+                    throw failure
+                }
                 break
             }
         }
@@ -121,7 +135,24 @@ class ReconciliationActor(
         return observed
     }
 
+    private fun scheduleRetry(attempt: Int) {
+        if (attempt >= RoomOperationRepository.MAX_STEP_ATTEMPTS) return
+        retryJob?.cancel()
+        val exponent = (attempt - 1).coerceIn(0, 30)
+        val multiplier = 1L shl exponent
+        val delayMillis = if (retryBaseDelayMillis > retryMaxDelayMillis / multiplier) {
+            retryMaxDelayMillis
+        } else {
+            retryBaseDelayMillis * multiplier
+        }
+        retryJob = actorScope.launch {
+            delay(delayMillis)
+            wake(WakeReason.RETRY)
+        }
+    }
+
     suspend fun stop() {
+        retryJob?.cancel()
         wakes.close()
         actorJob.join()
     }
@@ -132,6 +163,9 @@ class ReconciliationActor(
 
     companion object {
         const val DEFAULT_EFFECT_TIMEOUT_MILLIS = 30_000L
+        const val DEFAULT_RETRY_BASE_DELAY_MILLIS = 250L
+        const val DEFAULT_RETRY_MAX_DELAY_MILLIS = 30_000L
+        const val MAX_RETRY_DELAY_MILLIS = 5 * 60_000L
     }
 }
 

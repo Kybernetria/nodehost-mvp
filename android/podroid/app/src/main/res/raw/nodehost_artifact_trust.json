@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "artifacts": {
+    "vmlinuz-virt": {
+      "sha256": "9be1095a3d21a488c6a41299ae937fecabec4481c390d27f7da0d4fb0ea72b4b",
+      "sizeBytes": 20086848
+    },
+    "initrd.img": {
+      "sha256": "7c245ce7bb144008bf2869722226f6abd87b129bdc8b341da9918d4be8392b80",
+      "sizeBytes": 42195106
+    },
+    "alpine-rootfs.squashfs": {
+      "sha256": "9c992e851df2a24c66c384267e3c49d3b46397041ba9e9047905c97f4e041631",
+      "sizeBytes": 228204544
+    }
+  }
+}

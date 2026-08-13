@@ -135,6 +135,30 @@ class ProductionHostApiTest {
         assertEquals(OperationState.FAILED_RETRYABLE, replay.state)
     }
 
+    @Test fun deleteReplayUsesDurableReceiptAfterDesiredStateIsGone() = runBlocking {
+        val apply = ApplyRuntimeUseCase(operations, SecureOperationIdFactory())
+        val mutations = AndroidHostMutations(
+            context, database, operations, apply,
+            enrolledRepositoryOrigin = { URI("https://artifacts.example.test") },
+        )
+        apply.apply(
+            org.nodehost.model.RuntimeSpec(
+                generation = 1,
+                desiredState = org.nodehost.model.DesiredRuntimeState.RUNNING,
+                profileId = org.nodehost.model.VmProfileId("alpine-direct-qualification"),
+                memoryMiB = 512, vcpus = 1, dataDiskGiB = 4,
+            ), "delete-source-key-0001", "source".toByteArray(),
+        )
+        val key = "delete-replay-key-0001"
+        val canonical = "remove:default".toByteArray()
+        val first = mutations.removeVm(org.nodehost.model.RuntimeId.DEFAULT, key, canonical)
+        database.openHelper.writableDatabase.execSQL("DELETE FROM runtime_desired")
+
+        val replay = mutations.removeVm(org.nodehost.model.RuntimeId.DEFAULT, key, canonical)
+        assertEquals(first.id, replay.id)
+        assertEquals(first.state, replay.state)
+    }
+
     @Test fun cancellationWinningAtPublicationBoundaryCannotPublishImage() = runBlocking {
         val operationId = org.nodehost.model.OperationId("op-publication-race")
         database.dao().insertOperation(OperationEntity(

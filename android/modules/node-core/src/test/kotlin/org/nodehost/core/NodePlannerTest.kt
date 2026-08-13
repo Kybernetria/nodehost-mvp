@@ -53,6 +53,21 @@ class NodePlannerTest {
     }
 
     @Test
+    fun runningAtDesiredGenerationButBeforeGuestHealthWaitsForGuest() {
+        val plan = NodePlanner.plan(
+            runningDesired,
+            RuntimeObservation.Running(
+                RuntimeId.DEFAULT,
+                processId = 123,
+                guestReady = false,
+                appliedGeneration = runningDesired.generation,
+            ),
+        )
+
+        assertEquals(listOf(RuntimeStep.WaitForGuest), plan.steps)
+    }
+
+    @Test
     fun runningAtDesiredGenerationNeedsNoWork() {
         val plan = NodePlanner.plan(
             runningDesired,

@@ -47,15 +47,24 @@ data class OperationRecord(
 
 object OperationTransitions {
     private val allowed: Map<OperationState, Set<OperationState>> = mapOf(
-        OperationState.ACCEPTED to setOf(OperationState.PREFLIGHT, OperationState.CANCELLING),
+        OperationState.ACCEPTED to setOf(
+            OperationState.PREFLIGHT, OperationState.FETCHING, OperationState.VERIFYING,
+            OperationState.PREPARING_DISKS, OperationState.PREPARING_BOOT,
+            OperationState.STARTING_QEMU, OperationState.WAITING_FOR_QMP,
+            OperationState.BOOTSTRAPPING_GUEST, OperationState.WAITING_FOR_SSH,
+            OperationState.WAITING_FOR_GUEST_MESH, OperationState.SUCCEEDED,
+            OperationState.CANCELLING,
+        ),
         OperationState.PREFLIGHT to setOf(
             OperationState.FETCHING, OperationState.PREPARING_DISKS,
-            OperationState.WAITING_FOR_USER, OperationState.FAILED_RETRYABLE,
-            OperationState.FAILED_PERMANENT, OperationState.CANCELLING,
+            OperationState.SUCCEEDED, OperationState.WAITING_FOR_USER,
+            OperationState.FAILED_RETRYABLE, OperationState.FAILED_PERMANENT,
+            OperationState.CANCELLING,
         ),
         OperationState.FETCHING to setOf(
-            OperationState.VERIFYING, OperationState.WAITING_FOR_USER,
-            OperationState.FAILED_RETRYABLE, OperationState.FAILED_PERMANENT, OperationState.CANCELLING,
+            OperationState.VERIFYING, OperationState.PREPARING_DISKS,
+            OperationState.WAITING_FOR_USER, OperationState.FAILED_RETRYABLE,
+            OperationState.FAILED_PERMANENT, OperationState.CANCELLING,
         ),
         OperationState.VERIFYING to setOf(
             OperationState.PREPARING_DISKS, OperationState.FAILED_RETRYABLE,
@@ -78,8 +87,9 @@ object OperationTransitions {
             OperationState.FAILED_PERMANENT, OperationState.CANCELLING,
         ),
         OperationState.BOOTSTRAPPING_GUEST to setOf(
-            OperationState.WAITING_FOR_SSH, OperationState.FAILED_RETRYABLE,
-            OperationState.FAILED_PERMANENT, OperationState.CANCELLING,
+            OperationState.WAITING_FOR_SSH, OperationState.SUCCEEDED,
+            OperationState.FAILED_RETRYABLE, OperationState.FAILED_PERMANENT,
+            OperationState.CANCELLING,
         ),
         OperationState.WAITING_FOR_SSH to setOf(
             OperationState.WAITING_FOR_GUEST_MESH, OperationState.SUCCEEDED,
@@ -91,7 +101,12 @@ object OperationTransitions {
         ),
         OperationState.WAITING_FOR_USER to setOf(OperationState.PREFLIGHT, OperationState.CANCELLING),
         OperationState.FAILED_RETRYABLE to setOf(
-            OperationState.PREFLIGHT, OperationState.ROLLING_BACK, OperationState.CANCELLING,
+            OperationState.PREFLIGHT, OperationState.FETCHING, OperationState.VERIFYING,
+            OperationState.PREPARING_DISKS, OperationState.PREPARING_BOOT,
+            OperationState.STARTING_QEMU, OperationState.WAITING_FOR_QMP,
+            OperationState.BOOTSTRAPPING_GUEST, OperationState.WAITING_FOR_SSH,
+            OperationState.WAITING_FOR_GUEST_MESH, OperationState.ROLLING_BACK,
+            OperationState.CANCELLING,
         ),
         OperationState.CANCELLING to setOf(OperationState.CANCELLED, OperationState.ROLLING_BACK),
         OperationState.ROLLING_BACK to setOf(OperationState.ROLLED_BACK, OperationState.FAILED_PERMANENT),

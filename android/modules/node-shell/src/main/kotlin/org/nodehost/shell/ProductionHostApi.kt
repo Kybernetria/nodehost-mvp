@@ -268,10 +268,22 @@ internal class AndroidHostMutations(
 
     private fun Int?.orZero() = this ?: 0
 
-    override suspend fun removeVm(id: RuntimeId, idempotencyKey: String, canonicalRequest: ByteArray): OperationRecord {
+    override suspend fun removeVm(id: RuntimeId, idempotencyKey: String, canonicalRequest: ByteArray): OperationRecord = lock.withLock {
         require(id == RuntimeId.DEFAULT) { "MVP supports one runtime" }
+        // Check the durable receipt before reading desired state: a lost DELETE response may
+        // be retried after reconciliation has already removed the desired VM record.
+        operations.operationForIdempotencyKey(idempotencyKey)?.let { existing ->
+            require(existing.requestDigest == sha256(canonicalRequest)) {
+                "idempotency key reused with different request"
+            }
+            return@withLock existing
+        }
         val current = requireNotNull(operations.loadDesiredRuntime(id)) { "VM not found" }
-        return applyRuntime.apply(current.copy(generation = current.generation + 1, desiredState = DesiredRuntimeState.ABSENT), idempotencyKey, canonicalRequest)
+        applyRuntime.apply(
+            current.copy(generation = current.generation + 1, desiredState = DesiredRuntimeState.ABSENT),
+            idempotencyKey,
+            canonicalRequest,
+        )
     }
 
     override suspend fun cancelOperation(id: String, idempotencyKey: String, canonicalRequest: ByteArray): OperationRecord = lock.withLock {
@@ -290,7 +302,7 @@ internal class AndroidHostMutations(
             val count = db.query("SELECT COUNT(*) FROM cancel_operation_receipts").use { it.moveToFirst(); it.getInt(0) }
             require(count < MAX_CANCEL_RECEIPTS) { "cancel receipt capacity exceeded" }
             val result = operations.cancelOperation(
-                OperationId(id), setOf(OperationState.ACCEPTED, OperationState.FETCHING, OperationState.FAILED_RETRYABLE),
+                OperationId(id), OperationState.entries.filter { !it.terminal && it != OperationState.CANCELLING }.toSet(),
             )
             db.execSQL("INSERT INTO cancel_operation_receipts VALUES (?,?,?,?)", arrayOf<Any?>(idempotencyKey, digest, id, result.receiptJson().toString()))
             result

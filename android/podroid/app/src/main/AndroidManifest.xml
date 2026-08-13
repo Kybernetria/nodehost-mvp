@@ -80,6 +80,11 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Podroid">
 
+        <!-- Immutable trust anchors for APK-bundled VM artifacts. -->
+        <meta-data
+            android:name="org.nodehost.artifact-trust"
+            android:resource="@raw/nodehost_artifact_trust" />
+
         <!-- Main activity — single-activity Compose app -->
         <activity
             android:name=".MainActivity"

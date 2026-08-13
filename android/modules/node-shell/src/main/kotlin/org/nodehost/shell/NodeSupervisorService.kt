@@ -9,15 +9,20 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class NodeSupervisorService : Service() {
     private lateinit var supervisorScope: CoroutineScope
     private lateinit var reconciler: ReconciliationActor
     private lateinit var bootstrapServer: BootstrapMetadataServer
+    private var assetReadinessJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -38,7 +43,26 @@ class NodeSupervisorService : Service() {
             .build()
         val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
         ServiceCompat.startForeground(this, ID, notification, type)
-        reconciler.wake(WakeReason.SERVICE_STARTED)
+        // Podroid extracts the bundled Alpine artifacts asynchronously. Do not let the
+        // durable reconciler race that publication; imported applications without the
+        // optional hook retain the existing immediate-start behaviour.
+        val readiness = application as? NodeHostAssetReadiness
+        assetReadinessJob?.cancel()
+        assetReadinessJob = supervisorScope.launch {
+            repeat(ASSET_READINESS_ATTEMPTS) { attempt ->
+                try {
+                    readiness?.awaitNodeHostAssets()
+                    reconciler.wake(WakeReason.SERVICE_STARTED)
+                    return@launch
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    android.util.Log.e(TAG, "Node-host asset readiness attempt ${attempt + 1} failed", failure)
+                    if (attempt + 1 < ASSET_READINESS_ATTEMPTS) delay(ASSET_RETRY_MILLIS)
+                }
+            }
+            android.util.Log.e(TAG, "Node-host asset readiness exhausted; service start remains gated")
+        }
         return START_STICKY
     }
 
@@ -48,6 +72,7 @@ class NodeSupervisorService : Service() {
 
     override fun onDestroy() {
         // The pending intent is durable. Cancellation leaves it recoverable by the sticky restart.
+        assetReadinessJob?.cancel()
         reconciler.close()
         bootstrapServer.close()
         NodeHostGraph.stopServiceOwnedComponents()
@@ -68,5 +93,8 @@ class NodeSupervisorService : Service() {
     companion object {
         const val CHANNEL = "nodehost-runtime"
         const val ID = 47001
+        private const val TAG = "NodeHostSupervisorService"
+        private const val ASSET_READINESS_ATTEMPTS = 3
+        private const val ASSET_RETRY_MILLIS = 1_000L
     }
 }

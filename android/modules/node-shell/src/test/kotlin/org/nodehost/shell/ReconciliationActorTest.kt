@@ -81,6 +81,31 @@ class ReconciliationActorTest {
     }
 
     @Test
+    fun retryableFailureSchedulesBoundedRetryWithoutSecondWake() = runBlocking {
+        val operation = acceptDesired()
+        val delegate = FakeRuntimeBackend()
+        var failures = 0
+        val runtime = object : RuntimeBackend {
+            override suspend fun observe(id: RuntimeId) = delegate.observe(id)
+            override suspend fun execute(context: OperationContext, step: RuntimeStep): StepOutcome {
+                if (step == RuntimeStep.StartProcess && failures++ == 0) error("transient")
+                return delegate.execute(context, step)
+            }
+        }
+        val scope = newScope()
+        val actor = ReconciliationActor(
+            scope, store, runtime, retryBaseDelayMillis = 1, retryMaxDelayMillis = 2,
+        )
+        actor.wake(WakeReason.SERVICE_STARTED)
+        withTimeout(5_000) {
+            while (store.load(operation.id)?.state != OperationState.SUCCEEDED) kotlinx.coroutines.yield()
+        }
+        assertEquals(listOf(1, 2), store.steps(operation.id)
+            .filter { it.stepId == RuntimeStep.StartProcess.id }.map { it.attempt })
+        actor.stop()
+    }
+
+    @Test
     fun failedEffectIsRetriedWithANewBoundedAttemptAndStableJournal() = runBlocking {
         val operation = acceptDesired()
         val runtime = FakeRuntimeBackend().apply {
@@ -109,7 +134,7 @@ class ReconciliationActorTest {
         val executions = AtomicInteger()
         val runtime = object : RuntimeBackend {
             override suspend fun observe(id: RuntimeId): RuntimeObservation {
-                store.cancelOperation(operation.id, setOf(OperationState.ACCEPTED))
+                store.cancelOperation(operation.id, setOf(OperationState.ACCEPTED, OperationState.PREFLIGHT, OperationState.STARTING_QEMU))
                 return RuntimeObservation.Absent(id)
             }
             override suspend fun execute(context: OperationContext, step: RuntimeStep): StepOutcome {
@@ -142,7 +167,7 @@ class ReconciliationActorTest {
         }
         val completion = startActor(runtime)
         withTimeout(5_000) { entered.await() }
-        store.cancelOperation(operation.id, setOf(OperationState.ACCEPTED))
+        store.cancelOperation(operation.id, setOf(OperationState.ACCEPTED, OperationState.PREFLIGHT, OperationState.STARTING_QEMU))
         release.complete(Unit)
         withTimeout(5_000) { completion.await() }
 
@@ -157,7 +182,7 @@ class ReconciliationActorTest {
         val runtime = object : RuntimeBackend {
             override suspend fun observe(id: RuntimeId) = RuntimeObservation.Absent(id)
             override suspend fun execute(context: OperationContext, step: RuntimeStep): StepOutcome {
-                store.cancelOperation(operation.id, setOf(OperationState.ACCEPTED))
+                store.cancelOperation(operation.id, setOf(OperationState.ACCEPTED, OperationState.PREFLIGHT, OperationState.STARTING_QEMU))
                 return StepOutcome(true)
             }
         }
@@ -171,7 +196,7 @@ class ReconciliationActorTest {
     @Test
     fun restartAfterCancelDoesNotReplayEffects() = runBlocking {
         val operation = acceptDesired()
-        store.cancelOperation(operation.id, setOf(OperationState.ACCEPTED))
+        store.cancelOperation(operation.id, setOf(OperationState.ACCEPTED, OperationState.PREFLIGHT, OperationState.STARTING_QEMU))
         val runtime = FakeRuntimeBackend()
 
         runActor(runtime)
@@ -235,7 +260,7 @@ class ReconciliationActorTest {
         runActor(runtime)
 
         assertEquals(listOf(RuntimeStep.RequestShutdown.id), executed)
-        assertEquals(OperationState.ACCEPTED, store.load(operation.id)?.state)
+        assertEquals(OperationState.PREFLIGHT, store.load(operation.id)?.state)
     }
 
     @Test
@@ -257,7 +282,7 @@ class ReconciliationActorTest {
         }
 
         runActor(runtime)
-        assertEquals(OperationState.ACCEPTED, store.load(operation.id)?.state)
+        assertEquals(OperationState.PREFLIGHT, store.load(operation.id)?.state)
         assertEquals(listOf("qemu.request_shutdown"), executed)
 
         observation = RuntimeObservation.Stopping(RuntimeId.DEFAULT, 42, gracefulDeadlineExceeded = true)
